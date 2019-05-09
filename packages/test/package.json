@@ -1,23 +1,22 @@
 {
   "private": true,
   "name": "@ledgerhq/test",
-  "version": "4.33.6",
+  "version": "4.55.0",
   "main": "index.js",
   "license": "Apache-2.0",
   "dependencies": {
-    "@ledgerhq/hw-app-ada": "^4.33.3",
-    "@ledgerhq/hw-app-btc": "^4.33.6",
-    "@ledgerhq/hw-app-eth": "^4.32.0",
-    "@ledgerhq/hw-app-str": "^4.32.0",
-    "@ledgerhq/hw-app-xrp": "^4.32.0",
-    "@ledgerhq/hw-transport-mocker": "^4.32.0",
-    "@ledgerhq/hw-transport-node-hid": "^4.33.3",
-    "@ledgerhq/hw-transport-webusb": "^4.33.4",
-    "budo": "^11.4.1"
+    "@ledgerhq/hw-app-btc": "^4.55.0",
+    "@ledgerhq/hw-app-eth": "^4.55.0",
+    "@ledgerhq/hw-app-str": "^4.55.0",
+    "@ledgerhq/hw-app-xrp": "^4.55.0",
+    "@ledgerhq/hw-transport-mocker": "^4.55.0",
+    "@ledgerhq/hw-transport-node-hid": "^4.55.0",
+    "@ledgerhq/hw-transport-webusb": "^4.55.0",
+    "budo": "^11.6.1"
   },
   "devDependencies": {
-    "flow-bin": "^0.68.0",
-    "flow-typed": "^2.4.0"
+    "flow-bin": "^0.94.0",
+    "flow-typed": "^2.5.1"
   },
   "scripts": {
     "test-browser": "budo --ssl lib/index-browser.js",

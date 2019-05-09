@@ -1,10 +1,67 @@
-import TransportNodeHid from "@ledgerhq/hw-transport-node-hid";
+import {
+  RecordStore,
+  createTransportRecorder,
+  createTransportReplayer
+} from "@ledgerhq/hw-transport-mocker";
+import commandLineArgs from "command-line-args";
+import fs from "fs";
 import http from "http";
 import express from "express";
 import cors from "cors";
 import WebSocket from "ws";
 import bodyParser from "body-parser";
 import os from "os";
+
+const mainOptions = commandLineArgs([
+  {
+    name: "file",
+    alias: "f",
+    type: String
+  },
+  {
+    name: "silent",
+    alias: "s",
+    type: Boolean
+  }
+]);
+
+let Transport;
+let saveToFile = null;
+let recordStore;
+
+const log = mainOptions.silent ? () => {} : (...args) => console.log(...args);
+
+// --mock <file>
+// There are two ways to use the mock, either you record or you replay
+// - record means that it's a decoration in node-hid that will just save to a file
+// - replay means that it's going to re-use a recorded file and mock a transport instead of using an actual device
+// replay mode is the default unless environment RECORD_APDU_TO_FILE is defined, this allow to easily replay tests in record mode.
+if (mainOptions.file) {
+  if (process.env.RECORD_APDU_TO_FILE) {
+    log(`the APDUs will be recorded in ${mainOptions.file}`);
+    saveToFile = mainOptions.file;
+    recordStore = new RecordStore([]);
+    Transport = createTransportRecorder(
+      require("@ledgerhq/hw-transport-node-hid").default,
+      recordStore
+    );
+  } else {
+    recordStore = RecordStore.fromString(
+      fs.readFileSync(mainOptions.file, "utf8")
+    );
+    if (recordStore.isEmpty()) {
+      process.exit(0);
+    }
+    log(
+      `${recordStore.queue.length} mocked APDUs will be replayed from ${
+        mainOptions.file
+      }`
+    );
+    Transport = createTransportReplayer(recordStore);
+  }
+} else {
+  Transport = require("@ledgerhq/hw-transport-node-hid").default;
+}
 
 const ifaces = os.networkInterfaces();
 export const ips = Object.keys(ifaces)
@@ -35,6 +92,22 @@ app.get("/", (req, res) => {
   res.sendStatus(200);
 });
 
+if (recordStore) {
+  app.post("/end", (req, res) => {
+    try {
+      if (!saveToFile) {
+        recordStore.ensureQueueEmpty();
+      }
+      res.sendStatus(200);
+      process.exit(0);
+    } catch (e) {
+      res.sendStatus(400);
+      console.error(e.message);
+      process.exit(1);
+    }
+  });
+}
+
 let pending = false;
 app.post("/", bodyParser.json(), async (req, res) => {
   if (!req.body) return res.sendStatus(400);
@@ -47,11 +120,18 @@ app.post("/", bodyParser.json(), async (req, res) => {
   }
   pending = true;
   try {
-    const transport = await TransportNodeHid.create(5000);
+    const transport = await Transport.create(5000);
     try {
       data = await transport.exchange(Buffer.from(req.body.apduHex, "hex"));
     } finally {
       transport.close();
+      if (saveToFile) {
+        fs.writeFileSync(saveToFile, recordStore.toString());
+      } else if (recordStore) {
+        if (recordStore.isEmpty()) {
+          process.exit(0);
+        }
+      }
     }
   } catch (e) {
     error = e.toString();
@@ -59,11 +139,15 @@ app.post("/", bodyParser.json(), async (req, res) => {
   pending = false;
   const result = { data, error };
   if (data) {
-    console.log("HTTP:", req.body.apduHex, "=>", data.toString("hex"));
+    log("HTTP:", req.body.apduHex, "=>", data.toString("hex"));
   } else {
-    console.log("HTTP:", req.body.apduHex, "=>", error);
+    log("HTTP:", req.body.apduHex, "=>", error);
   }
   res.json(result);
+  if (error && error.name === "RecordStoreWrongAPDU") {
+    console.error(error.message);
+    process.exit(1);
+  }
 });
 
 let wsIndex = 0;
@@ -79,9 +163,16 @@ wss.on("connection", ws => {
       if (destroyed) return;
       destroyed = true;
       if (wsBusyIndex === index) {
-        console.log(`WS(${index}): close`);
+        log(`WS(${index}): close`);
         await transportP.then(transport => transport.close(), () => {});
         wsBusyIndex = 0;
+      }
+      if (saveToFile) {
+        fs.writeFileSync(saveToFile, recordStore.toString());
+      } else if (recordStore) {
+        if (recordStore.isEmpty()) {
+          process.exit(0);
+        }
       }
     };
 
@@ -101,17 +192,17 @@ wss.on("connection", ws => {
           destroyed = true;
           return;
         }
-        transportP = TransportNodeHid.create(5000);
+        transportP = Transport.create(5000);
         wsBusyIndex = index;
 
-        console.log(`WS(${index}): opening...`);
+        log(`WS(${index}): opening...`);
         try {
           transport = await transportP;
           transport.on("disconnect", () => ws.close());
-          console.log(`WS(${index}): opened!`);
+          log(`WS(${index}): opened!`);
           ws.send(JSON.stringify({ type: "opened" }));
         } catch (e) {
-          console.log(`WS(${index}): open failed! ${e}`);
+          log(`WS(${index}): open failed! ${e}`);
           ws.send(
             JSON.stringify({
               error: e.message
@@ -133,15 +224,19 @@ wss.on("connection", ws => {
       }
       try {
         const res = await transport.exchange(Buffer.from(apduHex, "hex"));
-        console.log(`WS(${index}): ${apduHex} => ${res.toString("hex")}`);
+        log(`WS(${index}): ${apduHex} => ${res.toString("hex")}`);
         if (destroyed) return;
         ws.send(
           JSON.stringify({ type: "response", data: res.toString("hex") })
         );
       } catch (e) {
-        console.log(`WS(${index}): ${apduHex} =>`, e);
+        log(`WS(${index}): ${apduHex} =>`, e);
         if (destroyed) return;
         ws.send(JSON.stringify({ type: "error", error: e.message }));
+        if (e.name === "RecordStoreWrongAPDU") {
+          console.error(e.message);
+          process.exit(1);
+        }
       }
     });
   } catch (e) {
@@ -149,11 +244,11 @@ wss.on("connection", ws => {
   }
 });
 
-console.log(
+log(
   "DEBUG_COMM_HTTP_PROXY=" +
     ["localhost", ...ips].map(ip => `ws://${ip}:${PORT}`).join("|")
 );
 
 server.listen(PORT, () => {
-  console.log(`\nNano S proxy started on ${ips[0]}\n`);
+  log(`\nNano S proxy started on ${ips[0]}\n`);
 });

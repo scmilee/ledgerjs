@@ -1,12 +1,17 @@
 //@flow
-import Transport, { TransportError } from "@ledgerhq/hw-transport";
+import Transport from "@ledgerhq/hw-transport";
 import type {
   Observer,
   DescriptorEvent,
   Subscription
 } from "@ledgerhq/hw-transport";
+import hidFraming from "@ledgerhq/devices/lib/hid-framing";
+import { identifyUSBProductId } from "@ledgerhq/devices";
+import {
+  TransportOpenUserCancelled,
+  TransportInterfaceNotAvailable
+} from "@ledgerhq/errors";
 import { getLedgerDevices, requestLedgerDevice, isSupported } from "./webusb";
-import hidFraming from "./hid-framing";
 
 const configurationValue = 1;
 const interfaceNumber = 2;
@@ -29,44 +34,78 @@ export default class TransportWebUSB extends Transport<USBDevice> {
     this.device = device;
   }
 
+  /**
+   * Check if WebUSB transport is supported.
+   */
   static isSupported = isSupported;
 
+  /**
+   * List the WebUSB devices that was previously authorized.
+   */
   static list = getLedgerDevices;
 
+  /**
+   * Actively listen to WebUSB devices and emit ONE device that was selected by the native permission UI.
+   *
+   * Important: it must be called in the context of a UI click!
+   */
   static listen = (
     observer: Observer<DescriptorEvent<USBDevice>>
   ): Subscription => {
     let unsubscribed = false;
-    requestLedgerDevice().then(device => {
-      if (!unsubscribed) {
-        observer.next({ type: "add", descriptor: device, device });
-        observer.complete();
+    requestLedgerDevice().then(
+      device => {
+        if (!unsubscribed) {
+          const deviceModel = identifyUSBProductId(device.productId);
+          observer.next({ type: "add", descriptor: device, deviceModel });
+          observer.complete();
+        }
+      },
+      error => {
+        observer.error(new TransportOpenUserCancelled(error.message));
       }
-    });
+    );
     function unsubscribe() {
       unsubscribed = true;
     }
     return { unsubscribe };
   };
 
+  /**
+   * Create a Ledger transport with a USBDevice
+   */
   static async open(device: USBDevice) {
     await device.open();
     if (device.configuration === null) {
       await device.selectConfiguration(configurationValue);
     }
     await device.reset();
-    await device.claimInterface(interfaceNumber);
+    try {
+      await device.claimInterface(interfaceNumber);
+    } catch (e) {
+      await device.close();
+      throw new TransportInterfaceNotAvailable(e.message);
+    }
     return new TransportWebUSB(device);
   }
 
+  /**
+   * Release the transport device
+   */
   async close(): Promise<void> {
+    await this.exchangeBusyPromise;
     await this.device.releaseInterface(interfaceNumber);
     await this.device.reset();
     await this.device.close();
   }
 
+  /**
+   * Exchange with the device using APDU protocol.
+   * @param apdu
+   * @returns a promise of apdu response
+   */
   exchange = (apdu: Buffer): Promise<Buffer> =>
-    this.atomic(async () => {
+    this.exchangeAtomicImpl(async () => {
       const { debug, channel, packetSize } = this;
       if (debug) {
         debug("=>" + apdu.toString("hex"));
@@ -95,25 +134,4 @@ export default class TransportWebUSB extends Transport<USBDevice> {
     });
 
   setScrambleKey() {}
-
-  busy: ?Promise<void>;
-
-  // $FlowFixMe
-  atomic = async f => {
-    if (this.busy) {
-      throw new TransportError("Transport race condition", "RaceCondition");
-    }
-    let resolveBusy;
-    const busyPromise = new Promise(r => {
-      resolveBusy = r;
-    });
-    this.busy = busyPromise;
-    try {
-      const res = await f();
-      return res;
-    } finally {
-      if (resolveBusy) resolveBusy();
-      this.busy = null;
-    }
-  };
 }

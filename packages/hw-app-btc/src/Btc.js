@@ -8,6 +8,17 @@ import { foreach, doIf, asyncWhile, splitPath, eachSeries } from "./utils";
 import type Transport from "@ledgerhq/hw-transport";
 import createHash from "create-hash";
 
+/**
+ * address format is one of legacy | p2sh | bech32
+ */
+export type AddressFormat = "legacy" | "p2sh" | "bech32";
+
+const addressFormatMap = {
+  legacy: 0,
+  p2sh: 1,
+  bech32: 2
+};
+
 const MAX_SCRIPT_BLOCK = 50;
 const DEFAULT_VERSION = 1;
 const DEFAULT_LOCKTIME = 0;
@@ -54,22 +65,26 @@ export default class Btc {
 
   getWalletPublicKey_private(
     path: string,
-    verify: boolean,
-    segwit: boolean
+    options: {
+      verify?: boolean,
+      format?: AddressFormat
+    } = {}
   ): Promise<{
     publicKey: string,
     bitcoinAddress: string,
     chainCode: string
   }> {
+    const { verify, format } = {
+      verify: false,
+      format: "legacy",
+      ...options
+    };
+    if (!(format in addressFormatMap)) {
+      throw new Error("btc.getWalletPublicKey invalid format=" + format);
+    }
     const paths = splitPath(path);
-    var p1 = 0x00;
-    var p2 = 0x00;
-    if (verify === true) {
-      p1 = 0x01;
-    }
-    if (segwit == true) {
-      p2 = 0x01;
-    }
+    var p1 = verify ? 1 : 0;
+    var p2 = addressFormatMap[format];
     const buffer = Buffer.alloc(1 + paths.length * 4);
     buffer[0] = paths.length;
     paths.forEach((element, index) => {
@@ -94,20 +109,50 @@ export default class Btc {
 
   /**
    * @param path a BIP 32 path
-   * @param segwit use segwit
+   * @param options an object with optional these fields:
+   *
+   * - verify (boolean) will ask user to confirm the address on the device
+   *
+   * - format ("legacy" | "p2sh" | "bech32") to use different bitcoin address formatter.
+   *
+   * NB The normal usage is to use:
+   *
+   * - legacy format with 44' paths
+   *
+   * - p2sh format with 49' paths
+   *
+   * - bech32 format with 173' paths
+   *
    * @example
-   * btc.getWalletPublicKey("44'/0'/0'/0").then(o => o.bitcoinAddress)
+   * btc.getWalletPublicKey("44'/0'/0'/0/0").then(o => o.bitcoinAddress)
+   * btc.getWalletPublicKey("49'/0'/0'/0/0", { format: "p2sh" }).then(o => o.bitcoinAddress)
    */
   getWalletPublicKey(
     path: string,
-    verify?: boolean = false,
-    segwit?: boolean = false
+    opts?:
+      | boolean
+      | {
+          verify?: boolean,
+          format?: AddressFormat
+        }
   ): Promise<{
     publicKey: string,
     bitcoinAddress: string,
     chainCode: string
   }> {
-    return this.getWalletPublicKey_private(path, verify, segwit);
+    let options;
+    if (arguments.length > 2 || typeof opts === "boolean") {
+      console.warn(
+        "btc.getWalletPublicKey deprecated signature used. Please switch to getWalletPublicKey(path, { format, verify })"
+      );
+      options = {
+        verify: !!opts,
+        format: arguments[2] ? "p2sh" : "legacy"
+      };
+    } else {
+      options = opts || {};
+    }
+    return this.getWalletPublicKey_private(path, options);
   }
 
   getTrustedInputRaw(
@@ -178,9 +223,12 @@ export default class Btc {
 
     const processInputs = () => {
       return eachSeries(inputs, input => {
+        const treeField = isDecred
+          ? input.tree || Buffer.from([0x00])
+          : Buffer.alloc(0);
         const data = Buffer.concat([
           input.prevout,
-          isDecred ? Buffer.from([0x00]) : Buffer.alloc(0), //tree
+          treeField,
           this.createVarint(input.script.length)
         ]);
         return this.getTrustedInputRaw(data).then(() => {
@@ -292,8 +340,8 @@ export default class Btc {
       ? additionals.includes("sapling")
         ? 0x05
         : overwinter
-          ? 0x04
-          : 0x02
+        ? 0x04
+        : 0x02
       : 0x00;
     return this.transport.send(
       0xe0,
@@ -701,7 +749,7 @@ btc.createPaymentTransactionNew(
         doIf(!resuming, () =>
           // Collect public keys
           foreach(inputs, (input, i) =>
-            this.getWalletPublicKey_private(associatedKeysets[i], false, false)
+            this.getWalletPublicKey_private(associatedKeysets[i])
           ).then(result => {
             for (let index = 0; index < result.length; index++) {
               publicKeys.push(
@@ -753,12 +801,12 @@ btc.createPaymentTransactionNew(
             inputs[i].length >= 3 && typeof inputs[i][2] === "string"
               ? Buffer.from(inputs[i][2], "hex")
               : !segwit
-                ? regularOutputs[i].script
-                : Buffer.concat([
-                    Buffer.from([OP_DUP, OP_HASH160, HASH_SIZE]),
-                    this.hashPublicKey(publicKeys[i]),
-                    Buffer.from([OP_EQUALVERIFY, OP_CHECKSIG])
-                  ]);
+              ? regularOutputs[i].script
+              : Buffer.concat([
+                  Buffer.from([OP_DUP, OP_HASH160, HASH_SIZE]),
+                  this.hashPublicKey(publicKeys[i]),
+                  Buffer.from([OP_EQUALVERIFY, OP_CHECKSIG])
+                ]);
           let pseudoTX = Object.assign({}, targetTransaction);
           let pseudoTrustedInputs = useBip143
             ? [trustedInputs[i]]
@@ -1113,28 +1161,25 @@ const tx1 = btc.splitTransaction("01000000014ea60aeac5252c14291d428915bd7ccd1bfc
     const numberInputs = varint[0];
     offset += varint[1];
     for (let i = 0; i < numberInputs; i++) {
-      let prevout = transaction.slice(offset, offset + 32);
-      offset += 32;
-      //Tree field
-      if (isDecred) {
-        offset += 1;
-      }
-      const prevOutIndex = transaction.slice(offset, offset + 4);
-      offset += 4;
-      prevout = Buffer.concat([prevout, prevOutIndex]);
-
+      const prevout = transaction.slice(offset, offset + 36);
+      offset += 36;
       let script = Buffer.alloc(0);
+      let tree = Buffer.alloc(0);
       //No script for decred, it has a witness
       if (!isDecred) {
         varint = this.getVarint(transaction, offset);
         offset += varint[1];
         script = transaction.slice(offset, offset + varint[0]);
         offset += varint[0];
+      } else {
+        //Tree field
+        tree = transaction.slice(offset, offset + 1);
+        offset += 1;
       }
 
       const sequence = transaction.slice(offset, offset + 4);
       offset += 4;
-      inputs.push({ prevout, script, sequence });
+      inputs.push({ prevout, script, sequence, tree });
     }
     varint = this.getVarint(transaction, offset);
     const numberOutputs = varint[0];
@@ -1312,7 +1357,8 @@ const outputScript = btc.serializeTransactionOutputs(tx1).toString('hex');
 type TransactionInput = {
   prevout: Buffer,
   script: Buffer,
-  sequence: Buffer
+  sequence: Buffer,
+  tree?: Buffer
 };
 
 /**
